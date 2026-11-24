@@ -618,27 +618,265 @@ unsafe fn name_thread(tid: u32, name: &[u16]) {
     }
 }
 
-/// The return addresses of the frames from `ctx` on (its RIP first), unwound with the
-/// functions' unwind data (registered for the title's images too); up to `n`.
-unsafe fn unwind(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, n: usize) -> Vec<usize> {
+const STACK_SNAPSHOT_BYTES: usize = 128 * 1024;
+
+/// Copy up to `dst.len()` contiguous readable committed stack bytes starting at `rsp`.
+/// Uses only `VirtualQuery` (a pure kernel syscall) and writes into a preallocated buffer so it
+/// takes no heap or loader locks while the target thread is suspended (#106).
+unsafe fn copy_stack_snapshot(rsp: usize, dst: &mut [u8]) -> usize {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
+    if rsp < 0x10000 || dst.is_empty() {
+        return 0;
+    }
+    let mut cur = rsp;
+    let mut total = 0usize;
+    while total < dst.len() {
+        let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        let n = VirtualQuery(cur as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>());
+        if n == 0 || mbi.State != MEM_COMMIT || mbi.Protect == 0 || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0 {
+            break;
+        }
+        let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        if region_end <= cur {
+            break;
+        }
+        let take = (region_end - cur).min(dst.len() - total);
+        std::ptr::copy_nonoverlapping(cur as *const u8, dst.as_mut_ptr().add(total), take);
+        total += take;
+        cur += take;
+    }
+    total
+}
+
+/// Redirect any general-purpose register pointing into the captured `[snap_base, snap_end)`
+/// range to the corresponding offset in the copied snapshot `[buf_base, ...)`.
+fn relocate_stack_regs(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, snap_base: u64, snap_end: u64, buf_base: u64) {
+    if snap_base >= snap_end {
+        return;
+    }
+    let regs = [
+        &mut ctx.Rax, &mut ctx.Rcx, &mut ctx.Rdx, &mut ctx.Rbx, &mut ctx.Rsp, &mut ctx.Rbp, &mut ctx.Rsi, &mut ctx.Rdi,
+        &mut ctx.R8, &mut ctx.R9, &mut ctx.R10, &mut ctx.R11, &mut ctx.R12, &mut ctx.R13, &mut ctx.R14, &mut ctx.R15,
+    ];
+    for r in regs {
+        if *r >= snap_base && *r < snap_end {
+            *r = (*r - snap_base) + buf_base;
+        }
+    }
+}
+
+fn gpr_by_index(ctx: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, idx: u8) -> u64 {
+    match idx & 0xF {
+        0 => ctx.Rax, 1 => ctx.Rcx, 2 => ctx.Rdx, 3 => ctx.Rbx,
+        4 => ctx.Rsp, 5 => ctx.Rbp, 6 => ctx.Rsi, 7 => ctx.Rdi,
+        8 => ctx.R8,  9 => ctx.R9,  10 => ctx.R10, 11 => ctx.R11,
+        12 => ctx.R12, 13 => ctx.R13, 14 => ctx.R14, _ => ctx.R15,
+    }
+}
+
+/// If `rip` is at an x64 epilogue (`[add rsp, imm] pop* (ret | jmp)`), return the maximum bytes
+/// above `Rsp` that `RtlVirtualUnwind` will read while simulating it.
+unsafe fn epilogue_read_bytes(rip: u64) -> Option<u64> {
+    if rip < 0x10000 || !crate::gpu::shader::readable(rip as usize, 1) {
+        return None;
+    }
+    let n = code_bytes_at(rip as usize, 16);
+    let b = std::slice::from_raw_parts(rip as *const u8, n);
+    let mut i = 0usize;
+    let mut add_bytes = 0u64;
+    let mut saw_sp_or_pop = false;
+    if b.get(i..i + 3) == Some(&[0x48, 0x83, 0xC4]) {
+        add_bytes = u64::try_from(*b.get(i + 3)? as i8).ok()?;
+        i += 4;
+        saw_sp_or_pop = true;
+    } else if b.get(i..i + 3) == Some(&[0x48, 0x81, 0xC4]) {
+        let imm = i32::from_le_bytes(b.get(i + 3..i + 7)?.try_into().ok()?);
+        add_bytes = u64::try_from(imm).ok()?;
+        i += 7;
+        saw_sp_or_pop = true;
+    }
+    let mut pops = 0u64;
+    while i < b.len() {
+        if (0x58..=0x5F).contains(&b[i]) {
+            pops += 1;
+            i += 1;
+            saw_sp_or_pop = true;
+        } else if b[i] == 0x41 && b.get(i + 1).is_some_and(|&x| (0x58..=0x5F).contains(&x)) {
+            pops += 1;
+            i += 2;
+            saw_sp_or_pop = true;
+        } else {
+            break;
+        }
+    }
+    let term = match *b.get(i)? {
+        0xC3 | 0xC2 => true,
+        0xF2 => b.get(i + 1) == Some(&0xC3),
+        0xE9 | 0xEB => saw_sp_or_pop,
+        _ => false,
+    };
+    term.then(|| add_bytes.saturating_add((pops + 1) * 8))
+}
+
+/// Check that every stack address `RtlVirtualUnwind` can dereference for `f` lies inside the
+/// copied snapshot `[buf_base, buf_end)`. Prevents out-of-bounds reads or dereferencing bogus
+/// frame-pointer values (e.g. `Rbp = 0x1e`).
+unsafe fn unwind_frame_in_snapshot(
+    base: u64,
+    rip: u64,
+    f: &windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY,
+    ctx: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+    buf_base: u64,
+    buf_end: u64,
+) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY;
+    const UNW_FLAG_CHAININFO: u8 = 4;
+    if let Some(need) = epilogue_read_bytes(rip) {
+        return ctx.Rsp >= buf_base && ctx.Rsp.checked_add(need).is_some_and(|e| e <= buf_end);
+    }
+    let in_buf = |addr: u64, len: u64| addr >= buf_base && addr.checked_add(len).is_some_and(|e| e <= buf_end);
+    let mut begin = f.BeginAddress;
+    let mut info_rva = f.Anonymous.UnwindInfoAddress;
+    let mut prolog_off = rip.saturating_sub(base.saturating_add(begin as u64));
+    let mut ptr = ctx.Rsp;
+    let mut stack_bytes = 0u64;
+    for _ in 0..8 {
+        let Some(info) = base.checked_add(info_rva as u64) else { return false };
+        if !crate::gpu::shader::readable(info as usize, 4) {
+            return false;
+        }
+        let hdr = std::slice::from_raw_parts(info as *const u8, 4);
+        let (version, flags, count) = (hdr[0] & 7, hdr[0] >> 3, hdr[2] as usize);
+        if version != 1 && version != 2 {
+            return false;
+        }
+        let (frame_reg, frame_off) = (hdr[3] & 0xF, ((hdr[3] >> 4) as u64) * 16);
+        let aligned_codes = (count + 1) & !1;
+        let chain_bytes = if flags & UNW_FLAG_CHAININFO != 0 {
+            std::mem::size_of::<IMAGE_RUNTIME_FUNCTION_ENTRY>()
+        } else {
+            0
+        };
+        let total_info = 4 + aligned_codes * 2 + chain_bytes;
+        if !crate::gpu::shader::readable(info as usize, total_info) {
+            return false;
+        }
+        let codes = std::slice::from_raw_parts((info as usize + 4) as *const u16, count);
+        let mut i = 0usize;
+        while i < count {
+            let word = codes[i];
+            let code_off = (word & 0xFF) as u64;
+            let op = ((word >> 8) & 0xF) as u8;
+            let op_info = ((word >> 12) & 0xF) as u64;
+            let active = code_off <= prolog_off;
+            let step = match op {
+                0 => {
+                    if active { stack_bytes = stack_bytes.saturating_add(8); }
+                    1
+                }
+                1 => {
+                    let (sz, slots) = if op_info == 0 {
+                        (codes.get(i + 1).copied().unwrap_or(0) as u64 * 8, 2)
+                    } else {
+                        let lo = codes.get(i + 1).copied().unwrap_or(0) as u32;
+                        let hi = codes.get(i + 2).copied().unwrap_or(0) as u32;
+                        (((hi << 16) | lo) as u64, 3)
+                    };
+                    if active { stack_bytes = stack_bytes.saturating_add(sz); }
+                    slots
+                }
+                2 => {
+                    if active { stack_bytes = stack_bytes.saturating_add((op_info + 1) * 8); }
+                    1
+                }
+                3 => {
+                    if active && frame_reg != 0 {
+                        let Some(p) = gpr_by_index(ctx, frame_reg).checked_sub(frame_off) else { return false };
+                        if p < buf_base || p >= buf_end {
+                            return false;
+                        }
+                        ptr = p;
+                        stack_bytes = 0;
+                    }
+                    1
+                }
+                4 | 8 => {
+                    let sz = if op == 4 { 8 } else { 16 };
+                    let off = codes.get(i + 1).copied().unwrap_or(0) as u64 * sz;
+                    if active {
+                        let Some(save_at) = ptr.checked_add(stack_bytes).and_then(|a| a.checked_add(off)) else { return false };
+                        if !in_buf(save_at, sz) {
+                            return false;
+                        }
+                    }
+                    2
+                }
+                5 | 9 => {
+                    let sz = if op == 5 { 8 } else { 16 };
+                    let lo = codes.get(i + 1).copied().unwrap_or(0) as u32;
+                    let hi = codes.get(i + 2).copied().unwrap_or(0) as u32;
+                    let off = ((hi << 16) | lo) as u64;
+                    if active {
+                        let Some(save_at) = ptr.checked_add(stack_bytes).and_then(|a| a.checked_add(off)) else { return false };
+                        if !in_buf(save_at, sz) {
+                            return false;
+                        }
+                    }
+                    3
+                }
+                6 | 7 => 1,
+                10 => {
+                    if active {
+                        stack_bytes = stack_bytes.saturating_add(if op_info != 0 { 48 } else { 40 });
+                    }
+                    1
+                }
+                _ => return false,
+            };
+            i += step;
+        }
+        if flags & UNW_FLAG_CHAININFO == 0 {
+            let Some(ret_at) = ptr.checked_add(stack_bytes) else { return false };
+            return in_buf(ret_at, 8);
+        }
+        let chain_ptr = (info as usize + 4 + aligned_codes * 2) as *const IMAGE_RUNTIME_FUNCTION_ENTRY;
+        let next = chain_ptr.read_unaligned();
+        begin = next.BeginAddress;
+        info_rva = next.Anonymous.UnwindInfoAddress;
+        prolog_off = u64::MAX;
+    }
+    false
+}
+
+/// The return addresses of the frames from `ctx` on (its RIP first), unwound against a captured
+/// stack snapshot `[snap_rsp, snap_rsp + snap.len())` with the functions' unwind data (registered
+/// for the title's images too); up to `n`.
+unsafe fn unwind(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, n: usize, snap_rsp: u64, snap: &[u8]) -> Vec<usize> {
     use windows_sys::Win32::System::Diagnostics::Debug::{RtlLookupFunctionEntry, RtlVirtualUnwind, UNW_FLAG_NHANDLER};
     let mut out = Vec::new();
+    let snap_end = snap_rsp.saturating_add(snap.len() as u64);
+    let buf_base = snap.as_ptr() as u64;
+    let buf_end = buf_base + snap.len() as u64;
     for _ in 0..n {
         let rip = ctx.Rip;
         if rip == 0 {
             break;
         }
         out.push(rip as usize);
+        relocate_stack_regs(ctx, snap_rsp, snap_end, buf_base);
+        if ctx.Rsp < buf_base || ctx.Rsp.checked_add(8).is_none_or(|e| e > buf_end) {
+            break;
+        }
         let mut base = 0u64;
         let f = RtlLookupFunctionEntry(rip, &mut base, std::ptr::null_mut());
         if f.is_null() {
-            // a leaf function: the return address is at RSP
-            if !crate::gpu::shader::readable(ctx.Rsp as usize, 8) {
-                break;
-            }
+            // a leaf function: the return address is at RSP inside the snapshot
             ctx.Rip = (ctx.Rsp as *const u64).read_unaligned();
             ctx.Rsp += 8;
         } else {
+            if !unwind_frame_in_snapshot(base, rip, &*f, ctx, buf_base, buf_end) {
+                break;
+            }
             let mut data = std::ptr::null_mut();
             let mut frame = 0u64;
             RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, rip, f, ctx, &mut data, &mut frame, std::ptr::null_mut());
@@ -661,6 +899,7 @@ pub fn dump_threads() {
             return;
         }
         let mut lines = Vec::new();
+        let mut stack_buf = vec![0u8; STACK_SNAPSHOT_BYTES];
         let mut te: THREADENTRY32 = std::mem::zeroed();
         te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
         let mut ok = Thread32First(snap, &mut te) != 0;
@@ -673,16 +912,22 @@ pub fn dump_threads() {
                     struct Aligned(CONTEXT);
                     let mut c: Aligned = std::mem::zeroed();
                     c.0.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
-                    // only the context is taken while the thread is suspended: the unwinding
-                    // (RtlLookupFunctionEntry), the module lookup (loader lock), the name and the
-                    // formatting (heap) take locks the suspended thread may hold (#106)
+                    // only the context and a bounded stack snapshot are taken while the thread
+                    // is suspended: unwinding (RtlLookupFunctionEntry), module lookup (loader
+                    // lock), the name and formatting (heap) take locks the suspended thread may
+                    // hold (#106)
+                    let mut snap_len = 0usize;
                     let got = SuspendThread(h) != u32::MAX && {
                         let ok = GetThreadContext(h, &mut c.0) != 0;
+                        if ok {
+                            snap_len = copy_stack_snapshot(c.0.Rsp as usize, &mut stack_buf);
+                        }
                         ResumeThread(h);
                         ok
                     };
                     if got {
-                        let frames: Vec<String> = unwind(&mut c.0, 14).into_iter().map(modules::describe_address).collect();
+                        let snap_rsp = c.0.Rsp;
+                        let frames: Vec<String> = unwind(&mut c.0, 14, snap_rsp, &stack_buf[..snap_len]).into_iter().map(modules::describe_address).collect();
                         lines.push(format!("thread {} '{}': {}", te.th32ThreadID, thread_name(h), frames.join(" < ")));
                     }
                     CloseHandle(h);
@@ -691,9 +936,7 @@ pub fn dump_threads() {
             ok = Thread32Next(snap, &mut te) != 0;
         }
         CloseHandle(snap);
-        crate::xlog_info!("thread dump ({} threads):
-{}", lines.len(), lines.join("
-"));
+        crate::xlog_info!("thread dump ({} threads):\n{}", lines.len(), lines.join("\n"));
         crate::log::flush();
     }
 }
@@ -1149,6 +1392,122 @@ mod tests {
             modules::unregister_mapped(code);
             VirtualFree(code as *mut _, 0, MEM_RELEASE);
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[inline(never)]
+    fn unwind_test_churn_stack(depth: usize, acc: &mut usize) {
+        let mut buf = [0u64; 16];
+        buf[depth & 15] = depth as u64 ^ (*acc as u64);
+        std::hint::black_box(&mut buf);
+        if depth > 0 {
+            unwind_test_churn_stack(depth - 1, acc);
+        }
+        *acc = acc.wrapping_add(buf[depth & 15] as usize + 1);
+        std::hint::black_box(*acc);
+    }
+
+    #[test]
+    fn dump_threads_unwinds_active_workers_without_crashing() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        let stop = Arc::new(AtomicBool::new(false));
+        let workers: Vec<_> = (0..4)
+            .map(|id| {
+                let stop = stop.clone();
+                std::thread::Builder::new()
+                    .name(format!("eh-churn-{id}"))
+                    .spawn(move || {
+                        let mut acc = id;
+                        while !stop.load(Ordering::Relaxed) {
+                            unwind_test_churn_stack(12, &mut acc);
+                            if id == 0 {
+                                // Exercise heap + loader queries concurrently to verify no #106 deadlock.
+                                let v = vec![acc; 64];
+                                std::hint::black_box(&v);
+                                let _ = modules::describe_address(unwind_test_churn_stack as *const () as usize);
+                            }
+                        }
+                    })
+                    .unwrap()
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        for _ in 0..8 {
+            dump_threads();
+        }
+        stop.store(true, Ordering::Release);
+        for w in workers {
+            w.join().unwrap();
+        }
+    }
+
+    #[inline(never)]
+    fn unwind_test_parked_leaf(ready: &std::sync::atomic::AtomicBool, release: &std::sync::atomic::AtomicBool) {
+        ready.store(true, Ordering::Release);
+        while !release.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+    }
+
+    #[inline(never)]
+    fn unwind_test_parked_outer(ready: &std::sync::atomic::AtomicBool, release: &std::sync::atomic::AtomicBool) {
+        let pad = [0x5Au64; 8];
+        std::hint::black_box(&pad);
+        unwind_test_parked_leaf(ready, release);
+        std::hint::black_box(&pad);
+    }
+
+    #[test]
+    fn unwind_uses_snapshot_after_worker_exits_and_stops_on_corrupt_context() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Diagnostics::Debug::{GetThreadContext, CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64};
+        use windows_sys::Win32::System::Threading::{GetCurrentThreadId, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME};
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let tid_cell = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (r1, rel1, t1) = (ready.clone(), release.clone(), tid_cell.clone());
+        let handle = std::thread::spawn(move || {
+            t1.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+            unwind_test_parked_outer(&r1, &rel1);
+        });
+        while !ready.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        let tid = tid_cell.load(Ordering::Acquire);
+        unsafe {
+            let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, tid);
+            assert!(!h.is_null());
+            #[repr(align(16))]
+            struct Aligned(CONTEXT);
+            let mut c: Aligned = std::mem::zeroed();
+            c.0.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
+            let mut snap_buf = vec![0u8; STACK_SNAPSHOT_BYTES];
+            assert_ne!(SuspendThread(h), u32::MAX);
+            assert_ne!(GetThreadContext(h, &mut c.0), 0);
+            let snap_len = copy_stack_snapshot(c.0.Rsp as usize, &mut snap_buf);
+            assert!(snap_len >= 64);
+            ResumeThread(h);
+            CloseHandle(h);
+
+            // Let the worker exit and its OS stack be freed BEFORE unwinding.
+            release.store(true, Ordering::Release);
+            handle.join().unwrap();
+
+            let mut c_ok = c.0;
+            let frames = unwind(&mut c_ok, 14, c.0.Rsp, &snap_buf[..snap_len]);
+            assert!(frames.len() >= 3, "expected >=3 frames from snapshot, got {}", frames.len());
+
+            // Truncated snapshot or bogus Rsp/Rbp must stop cleanly without faulting.
+            let mut c_trunc = c.0;
+            let trunc = unwind(&mut c_trunc, 14, c.0.Rsp, &snap_buf[..8]);
+            assert!(!trunc.is_empty());
+
+            let mut c_bad = c.0;
+            c_bad.Rsp = 0x1e;
+            c_bad.Rbp = 0x1e;
+            assert_eq!(unwind(&mut c_bad, 14, c.0.Rsp, &snap_buf[..snap_len]).len(), 1);
         }
     }
 }
