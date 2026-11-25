@@ -35,6 +35,8 @@ pub(super) struct Em {
     ps_done: bool,
     /// PS: program has at least one EXP with VM=1 (pixel survival follows VM rather than DONE)
     has_ps_vm: bool,
+    /// PS: an exp mrtz wrote the sample mask (declare and default-init SV_Coverage)
+    ps_writes_mask: bool,
     /// LDS used (compute): declare the groupshared array
     uses_lds: bool,
     /// scratch_* used: declare the per-lane private memory
@@ -580,6 +582,7 @@ impl Em {
             ps_modes: BTreeMap::new(),
             ps_done: false,
             has_ps_vm: false,
+            ps_writes_mask: false,
             uses_lds: false,
             uses_scratch: false,
             x64_words: 1,
@@ -2321,6 +2324,12 @@ impl Em {
                 if en & 1 == 1 && ps.outputs.iter().any(|e| matches!(e.system_value, 65 | 67 | 68)) {
                     st.push(format!("xo.xcl_depth = asfloat({});", srcs[0]));
                 }
+                // the sample mask: z of the 32-bit formats, VSRC1 [15:0] of the compressed one
+                // (Mesa, ac_nir_lower_ps_late.c, emit_ps_mrtz_export)
+                if enabled(2) && ps.outputs.iter().any(|e| e.system_value == 66) {
+                    self.ps_writes_mask = true;
+                    st.push(format!("xo.xcl_mask = {};", Self::exp_comp(srcs, compr, 2)));
+                }
             }
             (Mode::Pixel(_), 9) => {}
             (Mode::Mesh(_), 12) => {
@@ -2816,8 +2825,9 @@ impl Em {
         if base == "get_resinfo" {
             let mipv = compu(self, 0);
             let (ty, call) = match dim {
-                0 => ("Texture1D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_n); {t}_h = 1u; {t}_d = 1u;")),
-                1 => ("Texture2D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = 1u;")),
+                // RDNA2 gives 0 for the depth of a DIM without layers (1D, 2D, 2D MSAA)
+                0 => ("Texture1D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_n); {t}_h = 1u; {t}_d = 0u;")),
+                1 => ("Texture2D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = 0u;")),
                 2 => ("Texture3D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n);")),
                 // the hardware returns the layers (6 per cube), as for a 2D array
                 3 => ("TextureCubeArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n); {t}_d *= 6u;")),
@@ -2827,7 +2837,24 @@ impl Em {
                 _ => return Err("get_resinfo dim"),
             };
             self.line(&format!("uint4 {t}_r = uint4(0u, 0u, 0u, 0u);"));
-            self.line(&format!("if (and({act}, {t}_ok)) {{ {ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_w, {t}_h, {t}_d, {t}_n; {call} {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n); }}"));
+            let query = format!("{{ {ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_w, {t}_h, {t}_d, {t}_n; {call} {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n); }}");
+            let query = if matches!(dim, 0 | 1) {
+                // DIM 1D / 2D on a 2D MSAA (TYPE 14) or MSAA-array (TYPE 15) T#: RDNA2 gives
+                // (width, height, 0, 1) (AnyPS5 docs/dev/debt/shader.md, gfx1036). The host view is
+                // multisampled, so it is queried as one: a Texture1D / Texture2D handle on it leaves
+                // the level count to the host (RADV: log2(samples) + 1).
+                let ms = |ty: &str, extra: &str| {
+                    format!("{{ {ty}<float4> {t}_M = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_w, {t}_h, {extra}{t}_s; {t}_M.GetDimensions({t}_w, {t}_h, {extra}{t}_s); {t}_r = uint4({t}_w, {t}_h, 0u, 1u); }}")
+                };
+                format!(
+                    "if (({tw3} >> 28) == 14u) {} else if (({tw3} >> 28) == 15u) {} else {query}",
+                    ms("Texture2DMS", ""),
+                    ms("Texture2DMSArray", &format!("{t}_e, "))
+                )
+            } else {
+                query
+            };
+            self.line(&format!("if (and({act}, {t}_ok)) {{ {query} }}"));
             let comps2 = comps.clone();
             write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &|e: &str| e.to_string());
             return Ok(());
@@ -5087,13 +5114,18 @@ impl Em {
                         65 => h.push_str("    float xcl_depth : SV_Depth;\n"),
                         67 => h.push_str("    float xcl_depth : SV_DepthGreaterEqual;\n"),
                         68 => h.push_str("    float xcl_depth : SV_DepthLessEqual;\n"),
+                        66 if self.ps_writes_mask => h.push_str("    uint xcl_mask : SV_Coverage;\n"),
                         _ => {}
                     }
                 }
-                if !ps.outputs.iter().any(|e| matches!(e.system_value, 64 | 65 | 67 | 68)) {
+                if !self.ps_writes_mask && !ps.outputs.iter().any(|e| matches!(e.system_value, 64 | 65 | 67 | 68)) {
                     h.push_str("    float4 xcl_unused : SV_Target7;\n");
                 }
-                h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n    bool xcl_live = false;\n");
+                h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
+                if self.ps_writes_mask {
+                    h.push_str("    xo.xcl_mask = 0xFFFFFFFFu;\n");
+                }
+                h.push_str("    bool xcl_live = false;\n");
                 h.push_str(if self.opt.wave64 { "    lane_id = WaveGetLaneIndex();\n" } else { "    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n" });
                 if self.upper.is_some() {
                     h.push_str("    xcl_hw32 = WaveGetLaneCount() < 64u;\n");
@@ -5283,7 +5315,9 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
         h.push_str("        verts[i] = o;\n    }\n");
         let _ = writeln!(h, "    for (uint j = gi; j < np; j += {t}u) {{");
         let _ = writeln!(h, "        uint p = res.Load((rec + {tri_base}u + j) * 4u);");
-        h.push_str("        uint3 x = uint3(p & 0x3FFu, (p >> 10) & 0x3FFu, (p >> 20) & 0x3FFu);\n");
+        // RDNA2 EXP PRIM packs 9-bit vertex indices at [8:0], [18:10], [28:20] with
+        // per-edge flags at [9], [19], [29] and null_prim at [31].
+        h.push_str("        uint3 x = uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu);\n");
         h.push_str("        bool bad = or((p >> 31) != 0u, any(x >= nv));\n");
         h.push_str("        tris[j] = select(bad, uint3(0u, 0u, 0u), x);\n    }\n}\n");
         return h;
@@ -5302,7 +5336,7 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     h.push_str("    SetMeshOutputCounts(3u * n, n);\n");
     let _ = writeln!(h, "    for (uint j = gi; j < n; j += {t}u) {{");
     let _ = writeln!(h, "        uint p = res.Load((rec + {tri_base}u + first + j) * 4u);");
-    h.push_str("        uint3 x = uint3(p & 0x3FFu, (p >> 10) & 0x3FFu, (p >> 20) & 0x3FFu);\n");
+    h.push_str("        uint3 x = uint3(p & 0x1FFu, (p >> 10) & 0x1FFu, (p >> 20) & 0x1FFu);\n");
     h.push_str("        bool bad = or((p >> 31) != 0u, any(x >= nv));\n");
     h.push_str("        [unroll] for (uint c = 0u; c < 3u; c++) {\n");
     let _ = writeln!(h, "        uint b = (rec + {MESH_HEADER}u + select(bad, 0u, x[c]) * {vd}u) * 4u;");

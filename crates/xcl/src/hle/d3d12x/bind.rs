@@ -516,6 +516,9 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // a PC pipeline (also a stand-in or fallback: made with the title's root signature):
         // the title's root signature, which nothing else binds on the PC list – a draw without
         // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
+        if super::pso_async::is_pending(pso) {
+            super::list_x::note_dropped_draw(this);
+        }
         let rs = with(this, |s| s.rs_gfx) as *mut c_void;
         if let Some(r) = ID3D12RootSignature::from_raw_borrowed(&rs) {
             list.SetGraphicsRootSignature(r);
@@ -531,6 +534,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             Some(list)
         }
         Err(e) => {
+            super::list_x::note_dropped_draw(this);
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {

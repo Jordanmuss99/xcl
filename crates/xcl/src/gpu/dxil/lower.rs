@@ -195,6 +195,9 @@ pub struct Lw {
     pub uma_base_val: Option<Value>,
     /// temporaries handed out (`lower_mem::VAR_TMP`)
     pub ntmp: u32,
+    /// the `s_load_dword*` being lowered repeats an earlier one (`reload`): set by the
+    /// translator's loop for that instruction
+    pub reload: Option<super::reload::Reload>,
     /// the lane's scratch array (an alloca in the entry block)
     pub scratch: Option<Value>,
     /// MIMG instructions (pc) whose S# is built from constants in the code: the HLSL

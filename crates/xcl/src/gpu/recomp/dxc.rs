@@ -743,7 +743,7 @@ fn cached_file(file: &Path) -> Option<Vec<u8>> {
 
 /// Cheap validation before handing a cached blob to D3D12. DXIL uses the DXBC
 /// container header: magic, hash, version, total size, chunk count and offsets.
-fn valid_dxil_container(blob: &[u8]) -> bool {
+pub(super) fn valid_dxil_container(blob: &[u8]) -> bool {
     let rd = |at: usize| {
         blob.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
     };
