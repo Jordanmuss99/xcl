@@ -3552,7 +3552,7 @@ fn huge_pso_bytes() -> usize {
 }
 
 /// Huge driver compiles at once on the workers (default 1, `XCL_HUGE_PSO_CONCURRENCY`).
-fn huge_pso_concurrency() -> usize {
+pub(super) fn huge_pso_concurrency() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_CONCURRENCY").ok().as_deref(), 1, 1, 64))
 }
@@ -3607,6 +3607,29 @@ fn pso_trace() -> bool {
     *V.get_or_init(|| std::env::var("XCL_PSO_TRACE").is_ok_and(|v| v.trim() == "1"))
 }
 
+static DRIVER_COMPILES: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+
+struct DriverCompiling;
+
+impl DriverCompiling {
+    fn start() -> Self {
+        DRIVER_COMPILES[0].fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for DriverCompiling {
+    fn drop(&mut self) {
+        DRIVER_COMPILES[0].fetch_sub(1, Ordering::Relaxed);
+        DRIVER_COMPILES[1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// (Driver JIT compiles running now, finished so far).
+pub fn driver_compile_counts() -> (usize, usize) {
+    (DRIVER_COMPILES[0].load(Ordering::Relaxed), DRIVER_COMPILES[1].load(Ordering::Relaxed))
+}
+
 /// `driver_compile`, with the console record's hash (`fnv64` of the shader container, as in
 /// `[SHADER]` lines and `xcl shaders --measure-pso`) and whether a driver blob was supplied.
 /// Also returns the time spent in the driver alone (not waiting for a slot).
@@ -3625,7 +3648,10 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
         crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}");
     }
     let started = std::time::Instant::now();
-    let r = build();
+    let r = {
+        let _active = DriverCompiling::start();
+        build()
+    };
     let took = started.elapsed();
     if log {
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, slot.is_some(), waited));

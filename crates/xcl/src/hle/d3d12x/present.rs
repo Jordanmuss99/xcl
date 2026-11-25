@@ -389,7 +389,9 @@ unsafe fn show_compiling(hwnd: HWND) {
         .get_or_insert_with(|| FrameRate::new(now, presented))
         .sample(now, presented);
     let (_, failed, queued) = super::pso_async::counts();
-    let (running, done) = crate::gpu::recomp::dxc::compile_counts();
+    let (dxc_running, dxc_done) = crate::gpu::recomp::dxc::compile_counts();
+    let (drv_running, drv_done) = super::real::driver_compile_counts();
+    let (running, done) = (dxc_running + drv_running, dxc_done + drv_done);
     let active = running > 0 || queued > 0;
     let recent = {
         let mut last = LAST_ACTIVE.lock().unwrap();

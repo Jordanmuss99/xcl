@@ -20,7 +20,6 @@ struct Pending {
     real: AtomicUsize,
     done: Mutex<bool>,
     cv: Condvar,
-    compute: bool,
     /// of its shaders (`used`); 0 = none
     key: u64,
     /// it was used (`used::note` is told once)
@@ -126,7 +125,10 @@ fn complete(p: &Pending, real: usize) {
         if !orphan {
             p.real.store(real, Ordering::Release);
         }
-        *done = true;
+        let newly_done = !std::mem::replace(&mut *done, true);
+        if !orphan && newly_done {
+            PENDING_UNBUILT.fetch_sub(1, Ordering::Relaxed);
+        }
         p.cv.notify_all();
         orphan
     };
@@ -137,6 +139,7 @@ fn complete(p: &Pending, real: usize) {
 }
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
+static PENDING_UNBUILT: AtomicUsize = AtomicUsize::new(0);
 /// binds waiting right now for a pipeline still being built (`title_held`)
 static HELD: AtomicUsize = AtomicUsize::new(0);
 
@@ -220,21 +223,51 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
     submit_as(standin, compute, job, false, key);
 }
 
+fn prefetch_cs_enabled() -> bool {
+    std::env::var("XCL_PREFETCH_CS").map_or(true, |v| v.trim() != "0")
+}
+
+/// 6 GB of commit are free (matches `dxc::RESERVE_GB`; true when not known).
+fn cold_prefetch_commit_free() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    unsafe { GlobalMemoryStatusEx(&mut m) == 0 || m.ullAvailPageFile >= 6 << 30 }
+}
+
 fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+    submit_to(standin, compute, job, send, key, preload(), prefetch_cs_enabled());
+}
+
+fn submit_to(standin: usize, compute: bool, job: Job, send: bool, key: u64, pre: Option<&Preload>, prefetch_cs: bool) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
         real: AtomicUsize::new(0),
         done: Mutex::new(false),
         cv: Condvar::new(),
-        compute,
         key,
         used: Default::default(),
         orphan: Default::default(),
         late: Default::default(),
         demand: Default::default(),
     });
-    PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
+    {
+        let mut g = PENDING.lock().unwrap();
+        let prev = g.get_or_insert_with(HashMap::new).insert(standin, p.clone());
+        let replaced_unbuilt = prev.is_some_and(|old| {
+            let done = old.done.lock().unwrap();
+            if !*done {
+                old.orphan.store(true, Ordering::Release);
+                true
+            } else {
+                false
+            }
+        });
+        if !replaced_unbuilt {
+            PENDING_UNBUILT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
@@ -242,9 +275,12 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     if send {
         let _ = queue().lock().unwrap().send(p);
     } else if used::known(key) {
-        if let Some(q) = preload() {
-            q.list.lock().unwrap().push_back(p);
-            q.cv.notify_one();
+        if let Some(q) = pre {
+            q.push(p, false);
+        }
+    } else if compute && prefetch_cs {
+        if let Some(q) = pre {
+            q.push(p, true);
         }
     }
 }
@@ -330,12 +366,64 @@ mod used {
 }
 
 /// The workers that build the pipelines of an earlier run ahead of their first use
-/// (`XCL_PSO_PRELOAD=0`: off). Apart from the ones a bind sends to (`queue`) and at the lowest
-/// priority: a pipeline that is bound is not held up by the ones made ahead (whoever takes
-/// `job` first builds it), and the title's own threads are not either.
+/// (`XCL_PSO_PRELOAD=0`: off), plus cold compute pipelines (`XCL_PREFETCH_CS=0`: off).
+/// Apart from the ones a bind sends to (`queue`) and at the lowest priority: a pipeline that
+/// is bound is not held up by the ones made ahead (whoever takes `job` first builds it), and
+/// the title's own threads are not either.
+#[derive(Default)]
+struct PreloadQueues {
+    used_list: std::collections::VecDeque<Arc<Pending>>,
+    cold_cs_list: std::collections::VecDeque<Arc<Pending>>,
+}
+
+#[derive(Default)]
 struct Preload {
-    list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
+    queues: Mutex<PreloadQueues>,
     cv: Condvar,
+}
+
+impl Preload {
+    fn push(&self, p: Arc<Pending>, cold_cs: bool) {
+        let mut g = self.queues.lock().unwrap();
+        if cold_cs {
+            g.cold_cs_list.push_back(p);
+        } else {
+            g.used_list.push_back(p);
+        }
+        self.cv.notify_one();
+    }
+
+    #[cfg(test)]
+    fn pop_ready(&self, can_prefetch_cold: impl Fn() -> bool) -> Option<Arc<Pending>> {
+        let mut g = self.queues.lock().unwrap();
+        if let Some(p) = g.used_list.pop_front() {
+            return Some(p);
+        }
+        if !g.cold_cs_list.is_empty() && can_prefetch_cold() {
+            return g.cold_cs_list.pop_front();
+        }
+        None
+    }
+
+    fn wait_next(&self, can_prefetch_cold: impl Fn() -> bool) -> Arc<Pending> {
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+        let mut g = self.queues.lock().unwrap();
+        loop {
+            if let Some(p) = g.used_list.pop_front() {
+                return p;
+            }
+            if !g.cold_cs_list.is_empty() {
+                if can_prefetch_cold() {
+                    if let Some(p) = g.cold_cs_list.pop_front() {
+                        return p;
+                    }
+                }
+                g = self.cv.wait_timeout(g, PAUSE).unwrap().0;
+            } else {
+                g = self.cv.wait(g).unwrap();
+            }
+        }
+    }
 }
 
 fn preload() -> Option<&'static Preload> {
@@ -346,11 +434,11 @@ fn preload() -> Option<&'static Preload> {
             if std::env::var("XCL_PSO_PRELOAD").is_ok_and(|v| v.trim() == "0") {
                 return None;
             }
-            Some(Preload { list: Mutex::new(Default::default()), cv: Condvar::new() })
+            Some(Preload::default())
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
+        let n = super::real::huge_pso_concurrency().clamp(2, 4);
         for k in 0..n {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
                 unsafe {
@@ -359,15 +447,7 @@ fn preload() -> Option<&'static Preload> {
                 }
                 static DONE: AtomicUsize = AtomicUsize::new(0);
                 loop {
-                    let p = {
-                        let mut g = q.list.lock().unwrap();
-                        loop {
-                            if let Some(p) = g.pop_front() {
-                                break p;
-                            }
-                            g = q.cv.wait(g).unwrap();
-                        }
-                    };
+                    let p = q.wait_next(|| !title_held() && cold_prefetch_commit_free());
                     // (released by the title meanwhile)
                     if p.orphan.load(Ordering::Acquire) {
                         continue;
@@ -606,13 +686,10 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     pso
 }
 
-/// For binding: compute pipelines are waited for, graphics ones are not.
+/// For binding (`SetPipelineState`, `ClearState`, `Reset`): never waits; compute dispatches
+/// wait at `Dispatch` / `ExecuteIndirect` (`resolve_wait`).
 pub fn resolve_for_bind(pso: usize) -> usize {
-    match entry(pso) {
-        Some(p) if p.compute => resolve_wait(pso),
-        Some(_) => resolve(pso),
-        None => pso,
-    }
+    resolve(pso)
 }
 
 /// The title released stand-in `pso` for good: forget it (its address may come back for
@@ -626,6 +703,7 @@ pub fn released(pso: usize) -> usize {
     } else {
         // the worker stores its result into a Pending nobody will read: mark it orphaned
         p.orphan.store(true, Ordering::Release);
+        PENDING_UNBUILT.fetch_sub(1, Ordering::Relaxed);
         0
     }
 }
@@ -637,6 +715,153 @@ pub fn is_pending(pso: usize) -> bool {
 
 /// (built in the background, failed, still building)
 pub fn counts() -> (usize, usize, usize) {
-    let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
-    (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+    (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), PENDING_UNBUILT.load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn pending_unbuilt_slow() -> usize {
+        PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count())
+    }
+
+    fn assert_counts_match_slow() {
+        for _ in 0..8 {
+            let fast = counts().2;
+            let slow = pending_unbuilt_slow();
+            if fast == slow {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(counts().2, pending_unbuilt_slow(), "O(1) pending count diverged from PENDING scan");
+    }
+
+    #[test]
+    fn cold_cs_goes_to_cold_cs_list_and_graphics_excluded() {
+        let q = Preload::default();
+        let (cold_cs, gated_cs, cold_gfx, known_cs) = (0x7E57_C001usize, 0x7E57_C002usize, 0x7E57_C003usize, 0x7E57_C004usize);
+        let known_key = 0x5EED_C004u64;
+        used::earlier_run_used(known_key);
+
+        submit_to(cold_cs, true, Box::new(|| 0x1001), false, 0x5EED_C001, Some(&q), true);
+        submit_to(gated_cs, true, Box::new(|| 0x1002), false, 0x5EED_C002, Some(&q), false);
+        submit_to(cold_gfx, false, Box::new(|| 0x1003), false, 0x5EED_C003, Some(&q), true);
+        submit_to(known_cs, true, Box::new(|| 0x1004), false, known_key, Some(&q), true);
+
+        let g = q.queues.lock().unwrap();
+        assert_eq!(g.used_list.len(), 1);
+        assert_eq!(g.used_list[0].key, known_key);
+        assert_eq!(g.cold_cs_list.len(), 1);
+        assert_eq!(g.cold_cs_list[0].key, 0x5EED_C001);
+        drop(g);
+
+        for s in [cold_cs, gated_cs, cold_gfx, known_cs] {
+            let _ = released(s);
+        }
+    }
+
+    #[test]
+    fn used_list_has_priority_over_cold_cs_list_and_respects_gate() {
+        let q = Preload::default();
+        let (cold_cs, known_gfx) = (0x7E57_C011usize, 0x7E57_C012usize);
+        let known_key = 0x5EED_C012u64;
+        used::earlier_run_used(known_key);
+
+        submit_to(cold_cs, true, Box::new(|| 0x2001), false, 0x5EED_C011, Some(&q), true);
+        submit_to(known_gfx, false, Box::new(|| 0x2002), false, known_key, Some(&q), true);
+
+        let first = q.pop_ready(|| true).expect("used_list item");
+        assert_eq!(first.key, known_key, "used_list must drain before cold_cs_list");
+        assert!(q.pop_ready(|| false).is_none(), "cold_cs_list must wait when gate is false");
+        let second = q.pop_ready(|| true).expect("cold_cs_list item once used_list is empty and gate is true");
+        assert_eq!(second.key, 0x5EED_C011);
+
+        let _ = released(cold_cs);
+        let _ = released(known_gfx);
+    }
+
+    #[test]
+    fn resolve_for_bind_is_non_blocking_while_resolve_wait_completes() {
+        let standin = 0x7E57_C021usize;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        // Push via submit_to(..., None, ...) so preload workers don't touch it until resolve_for_bind enqueues it.
+        submit_to(
+            standin,
+            true,
+            Box::new(move || {
+                let _ = started_tx.send(());
+                let _ = go_rx.recv();
+                0xC0DE_0021
+            }),
+            false,
+            0x5EED_C021,
+            None,
+            false,
+        );
+
+        let t0 = Instant::now();
+        assert_eq!(resolve_for_bind(standin), standin, "resolve_for_bind must return stand-in without blocking");
+        assert!(t0.elapsed() < Duration::from_millis(200), "resolve_for_bind took {:?}", t0.elapsed());
+        started_rx.recv_timeout(Duration::from_secs(10)).expect("resolve_for_bind enqueued compute PSO onto workers");
+        assert!(is_pending(standin));
+
+        let waiter = std::thread::spawn(move || resolve_wait_for(standin, None));
+        go_tx.send(()).unwrap();
+        assert_eq!(waiter.join().unwrap(), 0xC0DE_0021);
+        assert!(!is_pending(standin));
+        assert_eq!(released(standin), 0xC0DE_0021);
+    }
+
+    #[test]
+    fn counts_tracks_submit_complete_failure_and_orphan_release_in_o1() {
+        let (ok_pso, fail_pso, orphan_pso) = (0x7E57_C031usize, 0x7E57_C032usize, 0x7E57_C033usize);
+        assert_counts_match_slow();
+
+        submit_to(ok_pso, false, Box::new(|| 0x3001), false, 0, None, false);
+        submit_to(fail_pso, false, Box::new(|| 0), false, 0, None, false);
+        assert_counts_match_slow();
+
+        assert_eq!(resolve_wait_for(ok_pso, None), 0x3001);
+        assert_eq!(resolve_wait_for(fail_pso, None), fail_pso);
+        assert_counts_match_slow();
+
+        assert_eq!(released(ok_pso), 0x3001);
+        assert_eq!(released(fail_pso), 0);
+        assert_counts_match_slow();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        submit_to(
+            orphan_pso,
+            false,
+            Box::new(move || {
+                let _ = started_tx.send(());
+                let _ = go_rx.recv();
+                0
+            }),
+            false,
+            0,
+            None,
+            false,
+        );
+        assert_eq!(resolve(orphan_pso), orphan_pso);
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let weak = Arc::downgrade(&entry(orphan_pso).unwrap());
+        assert_counts_match_slow();
+
+        assert_eq!(released(orphan_pso), 0);
+        assert_counts_match_slow();
+
+        go_tx.send(()).unwrap();
+        let start = Instant::now();
+        while weak.strong_count() > 0 && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(weak.strong_count(), 0);
+        assert_counts_match_slow();
+    }
 }
