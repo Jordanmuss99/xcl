@@ -2795,11 +2795,12 @@ impl Em {
                         self.line(&format!("float4 {t}_m1 = {t}_T.SampleLevel({t}_S, {c1}, (float)({l1}));"));
                         self.line(&format!("float4 {t}_s1 = {t}_T.Sample({t}_S, {});", tail(coord.clone())));
                         // S# word 2: XY_MAG_FILTER [21:20], XY_MIN_FILTER [23:22], MIP_FILTER [27:26];
-                        // word 0: MAX_ANISO_RATIO [11:9] – anisotropic only with an aniso min / mag
-                        // filter, as `desc::sampler_d3d12` decides. A level-0 SampleLevel filters with
+                        // word 0: MAX_ANISO_RATIO [11:9] – anisotropic only with an aniso bilinear (3)
+                        // min / mag filter, and linear = bilinear or aniso bilinear (aniso point is
+                        // point), as `desc::sampler_d3d12` decides. A level-0 SampleLevel filters with
                         // the mag filter, so mip 0 of a minified sample needs min = mag.
                         self.line(&format!(
-                            "uint {t}_mag = (({w2}) >> 20) & 3u, {t}_min = (({w2}) >> 22) & 3u; bool {t}_pm = ((({w2}) >> 26) & 3u) == 2u && !(({t}_mag >= 2u || {t}_min >= 2u) && ((({w0}) >> 9) & 7u) != 0u) && ({t}_l0 >= 1.0f || (({t}_mag | ({t}_mag >> 1)) & 1u) == (({t}_min | ({t}_min >> 1)) & 1u));"
+                            "uint {t}_mag = (({w2}) >> 20) & 3u, {t}_min = (({w2}) >> 22) & 3u; bool {t}_pm = ((({w2}) >> 26) & 3u) == 2u && !(({t}_mag == 3u || {t}_min == 3u) && ((({w0}) >> 9) & 7u) != 0u) && ({t}_l0 >= 1.0f || ({t}_mag & 1u) == ({t}_min & 1u));"
                         ));
                         format!("({t}_pm ? lerp({t}_m0, {t}_m1, {t}_L - {t}_l0) : {t}_s1)")
                     }
@@ -2861,7 +2862,9 @@ impl Em {
                 _ => return Err("get_resinfo dim"),
             };
             self.line(&format!("uint4 {t}_r = uint4(0u, 0u, 0u, 0u);"));
-            let query = format!("{{ {ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_w, {t}_h, {t}_d, {t}_n; {call} {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n); }}");
+            // a level past the last: RDNA2 gives 0 for every size and the level count. D3D12 asks
+            // for the same, but an AMD driver (RDNA4) answers for a level it clamped
+            let query = format!("{{ {ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_w, {t}_h, {t}_d, {t}_n; {call} if ({mipv} >= {t}_n) {{ {t}_w = 0u; {t}_h = 0u; {t}_d = 0u; }} {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n); }}");
             let query = if matches!(dim, 0 | 1) {
                 // DIM 1D / 2D on a 2D MSAA (TYPE 14) or MSAA-array (TYPE 15) T#: RDNA2 gives
                 // (width, height, 0, 1) (AnyPS5 docs/dev/debt/shader.md, gfx1036). The host view is
