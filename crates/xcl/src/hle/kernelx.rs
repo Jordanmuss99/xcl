@@ -1233,6 +1233,30 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
     Ok(true)
 }
 
+/// Reserve home storage for `bytes` of title physical pages: sparse UMA first, coherent UMA
+/// only when this `Uma` has no sparse windows (so overflow on runtime layouts never eats the
+/// coherent window's `KEEP` headroom or creates non-lazy homes), and finally plain
+/// `MEM_RESERVE` memory committed on first use (`home_again`).
+unsafe fn alloc_physical_home(u: &crate::gpu::uma::Uma, bytes: usize) -> Option<usize> {
+    if let Some((p, _)) = u.sparse_alloc(bytes, PHYS_PAGE) {
+        return Some(p);
+    }
+    if !u.has_sparse() {
+        if let Some(p) = u.alloc(bytes, PHYS_PAGE) {
+            return Some(p as usize);
+        }
+    }
+    let p = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        crate::xlog_info!(
+            "AllocateTitlePhysicalPages({}): no room in unified memory – their home is plain memory",
+            bytes / PHYS_PAGE
+        )
+    });
+    (p != 0).then_some(p)
+}
+
 pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, num: *mut usize, arr: *mut usize) -> BOOL {
     if num.is_null() || arr.is_null() || *num == 0 {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
@@ -1247,15 +1271,7 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     };
-    // (a sparse or plain home is committed when it is used: `home_again`); without room in
-    // unified memory plain memory (pages mapped into the title's own reservations never use
-    // their home: a retail game's 6.1 GB of them did not fit next to its GPU heaps)
-    let block = u.sparse_alloc(bytes, PHYS_PAGE).map(|(p, _)| p).or_else(|| u.alloc(bytes, PHYS_PAGE).map(|p| p as usize)).or_else(|| {
-        let p = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| crate::xlog_info!("AllocateTitlePhysicalPages({n}): no room in unified memory – their home is plain memory"));
-        (p != 0).then_some(p)
-    });
+    let block = alloc_physical_home(u, bytes);
     let Some(block) = block else {
         crate::xlog_warn!("AllocateTitlePhysicalPages({n}): no room");
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
@@ -3154,6 +3170,42 @@ mod tests {
             assert_eq!(VirtualFree(gpu, 0, mem::MEM_RELEASE), 1);
             assert_eq!(mirrors::source(gpu as usize + 0x2_0000), None);
             assert_eq!(VirtualFree(cpu, 0, mem::MEM_RELEASE), 1);
+        }
+    }
+
+    #[test]
+    fn physical_home_overflow_with_sparse_windows_skips_coherent_window() {
+        let u = crate::gpu::uma::Uma::for_runtime(16 << 20).unwrap();
+        let coherent_before = u.used();
+        let mut held = Vec::new();
+        for chunk in [4usize << 30, 1usize << 30, 64usize << 20, 1usize << 20, PHYS_PAGE] {
+            while let Some(p) = u.sparse_reserve(chunk) {
+                held.push(p);
+            }
+        }
+        assert!(u.sparse_alloc(2 * PHYS_PAGE, PHYS_PAGE).is_none());
+
+        unsafe {
+            let home = alloc_physical_home(&u, 2 * PHYS_PAGE).unwrap();
+            assert!(!u.contains(home), "overflow on sparse UMA must not consume the coherent window");
+            assert_eq!(u.used(), coherent_before, "coherent window headroom must stay untouched");
+            assert!(!committed_page(home), "plain-memory home must stay reserved until first use");
+            assert!(lazy_home(home));
+            assert_eq!(mem::VirtualFree(home as *mut c_void, 0, mem::MEM_RELEASE), 1);
+        }
+        for p in held {
+            assert!(u.sparse_release(p).is_some());
+        }
+    }
+
+    #[test]
+    fn physical_home_without_sparse_windows_uses_coherent_window() {
+        let u = crate::gpu::uma::Uma::with_windows(1, 16 << 20).unwrap();
+        assert!(!u.has_sparse());
+        unsafe {
+            let home = alloc_physical_home(&u, 2 * PHYS_PAGE).unwrap();
+            assert!(u.is_committed(home), "coherent-only UMA should still back physical homes");
+            assert!(u.free(home));
         }
     }
 }

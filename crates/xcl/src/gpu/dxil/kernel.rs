@@ -509,6 +509,7 @@ impl Lw {
             f32_rm: false,
             track_frexp_denorm: crate::gpu::recomp::emit::tracks_frexp_f32_denorm(insts),
             has_f64_round_op: false,
+            img_writes: crate::gpu::recomp::emit::image_write_srsrcs(insts),
             exec_cache: HashMap::new(),
             xs: None,
             xw: None,

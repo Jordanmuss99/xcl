@@ -151,7 +151,7 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
-        return compile_one();
+        return compile_one().map(|(c, _)| c);
     }
     let key = ShaderKey {
         hash: crate::gpu::shader::fnv64(blob),
@@ -337,6 +337,8 @@ mod translated {
         }
     }
 
+    /// `cached_rerouted` for a translation that is never rerouted (the tests')
+    #[cfg(test)]
     pub(super) fn cached_in(
         dir: &Path,
         ident: u64,
@@ -363,7 +365,9 @@ mod translated {
         Ok(c)
     }
 
-    /// `translate` through the disk (`identity()` zero: not used).
+    /// `translate` through the disk (`identity()` zero: not used). An enormous compute program
+    /// the direct translator made (`translate` says so) is kept under `rerouted_identity`, which
+    /// follows that translator's version: the HLSL path's identity does not.
     pub(super) fn cached(
         dir: &Path,
         blob: &[u8],
@@ -371,15 +375,77 @@ mod translated {
         sampler_base: u32,
         windows: u32,
         split: bool,
-        translate: impl FnOnce() -> Result<Compiled, String>,
+        translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
-        cached_in(dir, identity(), blob, stage, sampler_base, windows, split, translate)
+        cached_rerouted(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, translate)
     }
+
+    /// What the direct translator's output depends on besides the HLSL path's identity: its
+    /// version and sources, a forced compact form, the per-lane form (`direct_compute`).
+    fn direct_output() -> u64 {
+        static D: OnceLock<u64> = OnceLock::new();
+        *D.get_or_init(|| {
+            let id = direct_version(crate::gpu::dxil::kernel::TRANSLATOR_VERSION, env!("XCL_DIRECT_DXIL_SOURCE_ID"));
+            let id = match crate::gpu::dxil::kernel::compact_mode() {
+                Some(on) => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
+                None => id,
+            };
+            if crate::gpu::recomp::lower_dxil::enabled() {
+                identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
+            } else {
+                id
+            }
+        })
+    }
+
+    /// The identity of `ident`'s entries the direct translator (`direct`: `direct_output`) made
+    /// in its place (`pso::enormous`).
+    pub(super) fn rerouted_identity(ident: u64, direct: u64) -> u64 {
+        identity_for(&format!("{ident:016x}"), &format!("xcl-enormous-direct-{direct:016x}"))
+    }
+
+    pub(super) fn cached_rerouted(
+        dir: &Path,
+        ident: u64,
+        direct: u64,
+        blob: &[u8],
+        stage: Stage,
+        sampler_base: u32,
+        windows: u32,
+        split: bool,
+        translate: impl FnOnce() -> Result<(Compiled, bool), String>,
+    ) -> Result<Compiled, String> {
+        if ident == 0 {
+            return translate().map(|(c, _)| c);
+        }
+        let rerouted = rerouted_identity(ident, direct);
+        for id in [ident, rerouted] {
+            if let Some(c) = load_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob) {
+                super::dxc::note_memory_hit();
+                return Ok(c);
+            }
+        }
+        let (c, direct) = translate()?;
+        let id = if direct { rerouted } else { ident };
+        store_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob, &c);
+        Ok(c)
+    }
+}
+
+/// A compute program whose HLSL DXC would compile unoptimised (`dxc::UNOPTIMISED_ABOVE`)
+/// goes to the direct DXIL translator. A retail title's fully unrolled probe pass (88 863
+/// instructions): 30 MB of HLSL, 29 MB of DXIL at -O0 (14.7 MB at -O1 after 10 min of DXC),
+/// which the NVIDIA driver did not finish compiling at 40 GB; its direct DXIL is 4.3 MB and
+/// the driver builds it in 5 min within 6 GB.
+fn enormous(stage: Stage, hlsl_len: usize) -> bool {
+    stage == Stage::Compute && hlsl_len > dxc::UNOPTIMISED_ABOVE
 }
 
 // Changes here, in `fspx`, or in `console_translation` that alter the cached result must bump
 // `TRANSLATION_GLUE_REVISION` in build.rs; cache serialization changes need not bump it.
-fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
+/// The program's DXIL, and whether it is an `enormous` one the direct translator made (its
+/// disk cache entry then follows that translator's version: `translated::cached`).
+fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(Compiled, bool), String> {
     // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
     // for what it cannot translate yet
     if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
@@ -389,7 +455,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         match direct_compute(blob, sampler_base, windows, split_wave64) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated("CS");
-                return Ok(c);
+                return Ok((c, false));
             }
             Err(e) => direct_fallback("CS", &e),
         }
@@ -404,12 +470,29 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         match direct_graphics(blob, stage, sampler_base, windows) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated(if stage == Stage::Vertex { "VS" } else { "PS" });
-                return Ok(c);
+                return Ok((c, false));
             }
             Err(e) => direct_fallback(if stage == Stage::Vertex { "VS" } else { "PS" }, &e),
         }
     }
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
+    if enormous(stage, t.hlsl.len()) && !crate::gpu::dxil::kernel::enabled() {
+        if dxc::defer() {
+            return Err("DXIL not compiled yet".into());
+        }
+        match direct_compute(blob, sampler_base, windows, split_wave64) {
+            Ok(c) => {
+                crate::xlog_info!(
+                    "[SHADER] {:016x}: {} KB of HLSL would compile unoptimised – direct DXIL instead ({} KB)",
+                    crate::gpu::shader::fnv64(blob),
+                    t.hlsl.len() >> 10,
+                    c.dxil.len() >> 10
+                );
+                return Ok((c, true));
+            }
+            Err(e) => direct_fallback("CS", &e),
+        }
+    }
     if let Some([r, g, b]) = (stage == Stage::Pixel).then(|| debug_color(blob)).flatten() {
         t.hlsl = t.hlsl.replacen("    return xo;\n}", &format!("    xo.t0 = float4({r:.3}, {g:.3}, {b:.3}, 1.0);\n    return xo;\n}}"), 1);
     }
@@ -440,7 +523,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
     let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
-    Ok(Compiled { dxil, samplers: t.static_samplers })
+    Ok((Compiled { dxil, samplers: t.static_samplers }, false))
 }
 
 /// Every `X_T.Sample(args)` of generated HLSL as `X_T.SampleLevel(args, 0.0f)`.
@@ -933,7 +1016,7 @@ fn console_mesh_with(
             split_wave64: split,
             cache_dir: cache_dir.to_path_buf(),
         };
-        let from_disk = || translated::cached(cache_dir, blob, Stage::Mesh, 0, windows, split, compile_one);
+        let from_disk = || translated::cached(cache_dir, blob, Stage::Mesh, 0, windows, split, || compile_one().map(|c| (c, false)));
         cached_shader(cache, key, blob, from_disk)?.as_ref().clone()
     } else {
         compile_one()?
@@ -1243,6 +1326,51 @@ mod shader_cache_tests {
         // another split_wave64 / sampler base is another entry
         let other = cached_in(&dir, direct, blob, Stage::Compute, 0, 1, false, || Ok(compiled(4))).unwrap();
         assert_eq!(other.dxil[67], 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only compute HLSL that DXC would compile unoptimised goes to the direct translator.
+    #[test]
+    fn only_enormous_compute_hlsl_is_rerouted() {
+        let at = dxc::UNOPTIMISED_ABOVE;
+        assert!(enormous(Stage::Compute, at + 1));
+        assert!(!enormous(Stage::Compute, at), "compiled at -O1 as before");
+        assert!(!enormous(Stage::Vertex, at + 1));
+        assert!(!enormous(Stage::Pixel, at + 1));
+    }
+
+    /// A rerouted translation comes back from the disk under its own identity, which follows the
+    /// direct translator's version; the HLSL path's entries are not touched by a version bump.
+    #[test]
+    fn rerouted_disk_entries_follow_the_direct_translator() {
+        use translated::{cached_rerouted, rerouted_identity};
+        let dir = std::env::temp_dir().join(format!("xcl-translated-rerouted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (enormous_blob, plain_blob) = (b"console-enormous".as_slice(), b"console-plain".as_slice());
+        let ident = 0x1234;
+        let go = |blob: &[u8], version: u64, marker: u8, rerouted: bool, calls: &mut u32| {
+            cached_rerouted(&dir, ident, version, blob, Stage::Compute, 0, 1, true, || {
+                *calls += 1;
+                Ok((compiled(marker), rerouted))
+            })
+            .unwrap()
+            .dxil[0]
+        };
+        let mut calls = 0;
+        assert_eq!(go(enormous_blob, 7, 1, true, &mut calls), 1);
+        assert_eq!(go(enormous_blob, 7, 9, true, &mut calls), 1, "rerouted hit");
+        assert_eq!(calls, 1);
+        let rerouted_file = translated::file(&dir, rerouted_identity(ident, 7), enormous_blob, Stage::Compute, 0, 1, true);
+        assert!(rerouted_file.exists(), "kept under the rerouted identity");
+        assert!(!translated::file(&dir, ident, enormous_blob, Stage::Compute, 0, 1, true).exists(), "not under the HLSL one");
+        assert_eq!(go(plain_blob, 7, 2, false, &mut calls), 2);
+        assert_eq!(calls, 2);
+        // a new direct translator: the rerouted program is translated again, the HLSL one is not
+        assert_eq!(go(enormous_blob, 8, 3, true, &mut calls), 3, "a version bump misses");
+        assert_eq!(go(plain_blob, 8, 9, false, &mut calls), 2, "HLSL entry kept");
+        assert_eq!(calls, 3);
+        assert_ne!(rerouted_identity(ident, 7), ident);
+        assert_ne!(rerouted_identity(ident, 7), rerouted_identity(ident + 1, 7));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

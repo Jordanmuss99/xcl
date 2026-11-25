@@ -15,7 +15,7 @@ use crate::gpu::rdna2::{self, Decoded};
 /// (`console_heap::GLOBAL_MAX = 1 << 21`, leaving `index + 1` in-bounds for the paired UAV).
 /// Guarding / clamping dynamic heap indices prevents AMD Tier-3 GPUs from page-faulting
 /// on null, uninitialized, or unpatched console T# descriptors.
-const VIEW_HEAP_MAX_SRV: u32 = (1 << 21) - 1;
+pub(crate) const VIEW_HEAP_MAX_SRV: u32 = crate::hle::d3d12x::console_heap::GLOBAL_MAX - 1;
 /// D3D12 shader-visible sampler heap limit (`2048` samplers: `0..=2047`).
 const SAMPLER_HEAP_MASK: u32 = 0x7FF;
 
@@ -1445,6 +1445,16 @@ impl Lw {
         let fmt = self.lshrc(tw1, 20);
         let fmt = self.andc(fmt, 0x1FF);
         let cls = self.img_cls(fmt);
+        // an image store / atomic records its T# (`tw0 + 1`): a later image_load of the image
+        // reads through the UAV (`recomp::emit::image_write_srsrcs`)
+        if base.starts_with("store") || base.starts_with("atomic_") {
+            if let Some(k) = self.img_writes.iter().position(|&s| s == srsrc) {
+                let var = super::lower::VAR_IMG_WRITE + k as u32;
+                let (cur, t1) = (self.rd(var), self.addc(tw0, 1));
+                let nv = self.sel(valid, t1, cur);
+                self.wr(var, nv);
+            }
+        }
         if ms {
             return self.mimg_msaa(base, &ic, tw0, lkind, cls, &comps, vdata, d16, act, run);
         }
@@ -1455,10 +1465,32 @@ impl Lw {
                 for &t in &tmps {
                     self.wr(t, z);
                 }
+                // an image this invocation stored to: through the UAV, which sees the store (the
+                // SRV need not within a dispatch); image_load only – a UAV view is one mip
+                let mut rw = None;
+                if base == "load" && !self.img_writes.is_empty() {
+                    let t1 = self.addc(tw0, 1);
+                    for k in 0..self.img_writes.len() {
+                        let w = self.rd(super::lower::VAR_IMG_WRITE + k as u32);
+                        let e = self.cmp(Pred::Eq, w, t1);
+                        rw = Some(match rw {
+                            Some(r) => self.lor(r, e),
+                            None => e,
+                        });
+                    }
+                }
+                let ui = self.addc(tw0, 1);
                 for (cv, ct) in [(1u32, CompType::U32), (2, CompType::I32), (0, CompType::F32)] {
                     let is = self.cmpc(Pred::Eq, cls, cv);
                     let c = self.land(run, is);
-                    self.guarded(c, &mut |lw| {
+                    let (c_srv, c_uav) = match rw {
+                        Some(r) => {
+                            let nr = self.lnot(r);
+                            (self.land(c, nr), Some(self.land(c, r)))
+                        }
+                        None => (c, None),
+                    };
+                    self.guarded(c_srv, &mut |lw| {
                         let tex: Texture = lw.s.heap_texture(tw0, lkind, false, ct, 4, true);
                         let r = lw.s.texture_load(tex, Some(mip), &ic, &[]);
                         for k in 0..4 {
@@ -1467,6 +1499,18 @@ impl Lw {
                         }
                         Ok(())
                     })?;
+                    if let Some(cu) = c_uav {
+                        self.guarded(cu, &mut |lw| {
+                            lw.s.typed_uav_load_additional_formats();
+                            let tex: Texture = lw.s.heap_texture(ui, lkind, true, ct, 4, true);
+                            let r = lw.s.texture_load(tex, None, &ic, &[]);
+                            for k in 0..4 {
+                                let b = lw.bits(r[k]);
+                                lw.wr(tmps[k], b);
+                            }
+                            Ok(())
+                        })?;
+                    }
                 }
                 let r: Vec<Value> = tmps.iter().map(|&t| self.rd(t)).collect();
                 let vals: Vec<Value> = if d16 {
@@ -1788,12 +1832,12 @@ mod heap_bounds_tests {
         let dxil = kernel::translate(&code, kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }).expect("direct translate");
         validate::validate(&dxil).expect("dxil validate");
         let dis = validate::disassemble(&dxil).expect("dxil disassemble");
-        assert!(dis.contains("2097151"), "expected VIEW_HEAP_MAX_SRV guard in direct DXIL:\n{dis}");
+        assert!(dis.contains(&super::VIEW_HEAP_MAX_SRV.to_string()), "expected VIEW_HEAP_MAX_SRV guard in direct DXIL:\n{dis}");
         assert!(dis.contains("2047"), "expected 0x7FF sampler heap mask in direct DXIL:\n{dis}");
 
         let hlsl = recomp::translate(&code, &recomp::Options::default()).expect("hlsl translate");
         assert!(hlsl.complete(), "hlsl unsupported: {:?}", hlsl.unsupported);
-        assert!(hlsl.hlsl.contains("2097151u"), "expected VIEW_HEAP_MAX_SRV check in HLSL");
+        assert!(hlsl.hlsl.contains(&format!("{}u", super::VIEW_HEAP_MAX_SRV)), "expected VIEW_HEAP_MAX_SRV check in HLSL");
         assert!(hlsl.hlsl.contains("& 0x7FFu"), "expected 0x7FFu sampler heap mask in HLSL");
         assert!(!hlsl.hlsl.contains("& 0xFFFu"), "unexpected unclamped 0xFFFu sampler mask in HLSL");
         // Ensure atomic UAV handle creation is inside the guarded `if (and(..., ..._ok))` block.
@@ -1812,11 +1856,11 @@ mod heap_bounds_tests {
         let k = kernel::translate_pixel(&code, kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }, &ps).expect("direct ps translate");
         validate::validate(&k.dxil).expect("dxil ps validate");
         let dis = validate::disassemble(&k.dxil).expect("dxil ps disassemble");
-        assert!(dis.contains("2097151"), "expected VIEW_HEAP_MAX_SRV clamp in PS DXIL:\n{dis}");
+        assert!(dis.contains(&super::VIEW_HEAP_MAX_SRV.to_string()), "expected VIEW_HEAP_MAX_SRV clamp in PS DXIL:\n{dis}");
         assert!(dis.contains("2047"), "expected 0x7FF sampler mask in PS DXIL:\n{dis}");
 
         let hlsl = recomp::translate(&code, &recomp::Options { mode: recomp::Mode::Pixel(ps), ..Default::default() }).expect("hlsl ps translate");
         assert!(hlsl.complete(), "hlsl ps unsupported: {:?}", hlsl.unsupported);
-        assert!(hlsl.hlsl.contains("select(") && hlsl.hlsl.contains("2097151u"), "expected convergent clamp in PS HLSL");
+        assert!(hlsl.hlsl.contains("select(") && hlsl.hlsl.contains(&format!("{}u", super::VIEW_HEAP_MAX_SRV)), "expected convergent clamp in PS HLSL");
     }
 }

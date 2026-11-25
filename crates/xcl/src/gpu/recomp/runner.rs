@@ -391,9 +391,9 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
                 uv.Anonymous.Buffer = D3D12_BUFFER_UAV { NumElements: t.width, ..Default::default() };
             }
         }
-        if !t.uav {
-            dev.CreateShaderResourceView(&r, Some(&sv), at(&heap, 2 * i, inc));
-        }
+        // a UAV texture has its SRV too, as D3D12.X gives a console image UAV a companion SRV
+        // (RDNA images have no SRV / UAV distinction: the shader may read the slot)
+        dev.CreateShaderResourceView(&r, Some(&sv), at(&heap, 2 * i, inc));
         if t.uav {
             dev.CreateUnorderedAccessView(&r, None::<&ID3D12Resource>, Some(&uv), at(&heap, 2 * i + 1, inc));
         }

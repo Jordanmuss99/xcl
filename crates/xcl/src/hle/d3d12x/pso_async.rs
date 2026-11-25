@@ -184,6 +184,11 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
                 let next = rx.lock().unwrap().recv();
                 let Ok(p) = next else { return };
+                // (released by the title meanwhile)
+                if p.orphan.load(Ordering::Acquire) {
+                    let _ = p.job.lock().unwrap().take();
+                    continue;
+                }
                 // (None: a bind took it and builds it itself)
                 let job = p.job.lock().unwrap().take();
                 if let Some(job) = job {
@@ -592,6 +597,73 @@ mod used_tests {
         assert!(used::noted(unknown_key) && used::noted(known_key), "a first use is kept for the next run");
         released(known);
         released(unknown);
+    }
+
+    /// A queued normal worker job whose stand-in was released before a worker starts it is
+    /// skipped as orphaned instead of entering the compiler.
+    #[test]
+    fn a_released_queued_pipeline_is_not_built_by_normal_workers() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut blockers = Vec::with_capacity(n);
+        for k in 0..n {
+            let standin = 0x7E57_9720usize + k;
+            let started_tx = started_tx.clone();
+            let gate = gate.clone();
+            submit(standin, false, Box::new(move || {
+                let _ = started_tx.send(());
+                let mut open = gate.0.lock().unwrap();
+                while !*open {
+                    open = gate.1.wait(open).unwrap();
+                }
+                0x9720 + k
+            }));
+            blockers.push(standin);
+        }
+        for _ in 0..n {
+            started_rx.recv_timeout(Duration::from_secs(10)).expect("normal workers saturated");
+        }
+
+        let target = 0x7E57_97FFusize;
+        let ran = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let ran_job = ran.clone();
+        let drop_flag = DropFlag(dropped.clone());
+        submit(target, false, Box::new(move || {
+            let _keep = &drop_flag;
+            ran_job.store(true, Ordering::Release);
+            0x9721
+        }));
+        assert_eq!(released(target), 0);
+
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dropped.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(dropped.load(Ordering::Acquire), "queued orphan job was never drained");
+        assert!(!ran.load(Ordering::Acquire), "released job reached the compiler");
+
+        for standin in blockers {
+            let start = Instant::now();
+            while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let _ = released(standin);
+        }
     }
 }
 
