@@ -1,7 +1,7 @@
 //! Bounded preparation of file-backed zlib requests. The queue thread owns
 //! file reads, cancellation checks, and retirement; decoders own private buffers.
 
-use super::{note_request, read_exact_at, writable, Entry, FileInner, QueueInner, Request, E_ABORT, E_ACCESS_VIOLATION, E_FILE_HANDLE, E_ZLIB_DATA};
+use super::{note_request, read_exact_at, writable, Entry, FailureStage, FileInner, QueueInner, Request, E_ABORT, E_ACCESS_VIOLATION, E_FILE_HANDLE, E_ZLIB_DATA};
 use crate::util::{HRESULT, S_OK};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -469,10 +469,19 @@ impl<'a> Pipeline<'a> {
             }
         });
         if let Err(hr) = result {
-            self.queue.update_error(hr, task.req, task.file.as_deref(), since_status);
+            self.queue.update_error(hr, task.req, task.file.as_deref(), failure_stage(hr), since_status);
         }
         #[cfg(test)]
         notify_test(self.queue, TestEvent::Retired(task.seq));
+    }
+}
+
+/// The pool reports a failure as an HRESULT only, so its stage is read from the code.
+fn failure_stage(hr: HRESULT) -> FailureStage {
+    match hr {
+        E_ACCESS_VIOLATION => FailureStage::VirtualDestination,
+        E_ZLIB_DATA | E_ABORT => FailureStage::Decompression,
+        _ => FailureStage::FileRead,
     }
 }
 

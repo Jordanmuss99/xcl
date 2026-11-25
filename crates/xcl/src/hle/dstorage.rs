@@ -204,10 +204,68 @@ pub struct DStorageStats {
     /// BCPack requests the decoder ran on, by `DSTORAGE_BCPACK_MODE`
     #[serde(default)]
     pub bcpack_unpacked: BTreeMap<String, BcpackUnpackStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_stages: Option<BTreeMap<FailureStage, FailureStageCounts>>,
 }
 
 pub fn stats() -> DStorageStats {
-    DStorageStats { bcpack_refused: BCPACK.stats(), bcpack_unpacked: UNPACKED.stats() }
+    DStorageStats { bcpack_refused: BCPACK.stats(), bcpack_unpacked: UNPACKED.stats(), failure_stages: failure_counters().map(|c| c.snapshot()) }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureStage {
+    EnqueueValidation,
+    EnqueueFile,
+    DestinationSnapshot,
+    SourceSnapshot,
+    VirtualDestination,
+    MemorySource,
+    FileRead,
+    Decompression,
+    PhysicalDelivery,
+}
+
+const FAILURE_STAGES: [FailureStage; 9] = [
+    FailureStage::EnqueueValidation, FailureStage::EnqueueFile, FailureStage::DestinationSnapshot,
+    FailureStage::SourceSnapshot, FailureStage::VirtualDestination, FailureStage::MemorySource,
+    FailureStage::FileRead, FailureStage::Decompression, FailureStage::PhysicalDelivery,
+];
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureStageCounts {
+    pub access_violation: u64,
+    pub other_hresult: u64,
+}
+
+#[derive(Default)]
+struct FailureCounters(Mutex<[FailureStageCounts; FAILURE_STAGES.len()]>);
+
+impl FailureCounters {
+    fn note(&self, stage: FailureStage, hr: HRESULT) {
+        let mut counts = self.0.lock().unwrap();
+        let count = &mut counts[stage as usize];
+        if hr == E_ACCESS_VIOLATION { count.access_violation += 1; } else { count.other_hresult += 1; }
+    }
+
+    fn snapshot(&self) -> BTreeMap<FailureStage, FailureStageCounts> {
+        FAILURE_STAGES.into_iter().zip(*self.0.lock().unwrap()).collect()
+    }
+}
+
+fn failure_counters() -> Option<&'static Arc<FailureCounters>> {
+    static COUNTERS: OnceLock<Option<Arc<FailureCounters>>> = OnceLock::new();
+    COUNTERS.get_or_init(|| {
+        std::env::var("XCL_DSTORAGE_FAILURE_STAGES").is_ok_and(|v| v == "1").then(|| Arc::new(FailureCounters::default()))
+    }).as_ref()
+}
+
+pub fn log_failure_stages() {
+    if let Some(counts) = failure_counters() {
+        let parts: Vec<_> = counts.snapshot().iter()
+            .map(|(stage, n)| format!("{stage:?}={}/{}", n.access_violation, n.other_hresult)).collect();
+        crate::xlog_info!("DirectStorage failure stages (cumulative access/other): {}", parts.join(", "));
+    }
 }
 
 /// BCPack requests that reached the decoder, by mode.
@@ -870,22 +928,22 @@ fn note_request(r: &Request) {
 }
 
 /// Run a request; the destination gets the bytes or nothing.
-unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
+unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), (FailureStage, HRESULT)> {
     let n = r.destination_size as usize;
     note_request(r);
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
-        return Err(E_ACCESS_VIOLATION);
+        return Err((FailureStage::VirtualDestination, E_ACCESS_VIOLATION));
     }
     let src: Vec<u8> = if r.memory_source() {
         let mut b = vec![0u8; r.source_size as usize];
         if r.source_physical_pages() {
-            let pages = src_pages.ok_or(E_ACCESS_VIOLATION)?;
+            let pages = src_pages.ok_or((FailureStage::MemorySource, E_ACCESS_VIOLATION))?;
             if !crate::hle::kernelx::read_physical_pages(pages, r.source_page_offset as usize, &mut b) {
-                return Err(E_ACCESS_VIOLATION);
+                return Err((FailureStage::MemorySource, E_ACCESS_VIOLATION));
             }
         } else {
             if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
-                return Err(E_ACCESS_VIOLATION);
+                return Err((FailureStage::MemorySource, E_ACCESS_VIOLATION));
             }
             if !b.is_empty() {
                 std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
@@ -893,28 +951,28 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         }
         b
     } else {
-        let f = file.and_then(|f| f.handle()).ok_or(E_FILE_HANDLE)?;
+        let f = file.and_then(|f| f.handle()).ok_or((FailureStage::FileRead, E_FILE_HANDLE))?;
         let mut b = vec![0u8; r.source_size as usize];
-        read_exact_at(&f, r.offset, &mut b)?;
+        read_exact_at(&f, r.offset, &mut b).map_err(|hr| (FailureStage::FileRead, hr))?;
         b
     };
 
     let bc = r.bcpack();
     if r.swizzle() != 0 || (bc != 0 && !super::bcpack::can_decode(bc)) {
-        return Err(E_DECOMPRESSION);
+        return Err((FailureStage::Decompression, E_DECOMPRESSION));
     }
 
     // the stages in the console's order: zlib, then BCPack
     let stage1: Vec<u8> = if r.zlib() {
         let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
-        let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
+        let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| (FailureStage::Decompression, E_ZLIB_DATA))?;
         // zlib yields `intermediate_size` bytes; when the title names none, the destination's
         // size, or before BCPack a stream of any size up to it. That last case is XCL's
         // leniency, as is a BCPack stream no smaller than its blocks: the GDK documents
         // `IntermediateSize` as the size of the stream BCPack reads, and what the console does
         // with a request that leaves it 0 was not tested.
         if d.len() != stage1_len && (bc == 0 || r.intermediate_size != 0) {
-            return Err(E_ZLIB_DATA);
+            return Err((FailureStage::Decompression, E_ZLIB_DATA));
         }
         if bc == 0 && d.len() < n {
             d.resize(n, 0);
@@ -923,10 +981,10 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     } else {
         src
     };
-    let payload = if bc != 0 { bcpack_unpack(r, &stage1, n)? } else { stage1 };
+    let payload = if bc != 0 { bcpack_unpack(r, &stage1, n).map_err(|hr| (FailureStage::Decompression, hr))? } else { stage1 };
 
     if r.dest_physical_pages() {
-        let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
+        let pages = dest_pages.ok_or((FailureStage::PhysicalDelivery, E_ACCESS_VIOLATION))?;
         // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
         // read again now. A retail title keeps its page arrays in its own tables and fills an
         // entry after EnqueueRequest – its streaming requests were refused by the thousand
@@ -948,7 +1006,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             pages
         };
         if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
-            return Err(E_ACCESS_VIOLATION);
+            return Err((FailureStage::PhysicalDelivery, E_ACCESS_VIOLATION));
         }
     } else if n > 0 {
         std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
@@ -994,6 +1052,7 @@ enum Entry {
     Refused {
         seq: u64,
         hr: HRESULT,
+        stage: FailureStage,
         req: Request,
         file: Option<Arc<FileInner>>,
         /// a refused BCPack request under `XCL_DSTORAGE_BCPACK_FILL`: where its solid blocks go
@@ -1042,11 +1101,15 @@ struct QueueInner {
     pool_override: OnceLock<Option<Arc<parallel::DecompressPool>>>,
     #[cfg(test)]
     test_hook: OnceLock<parallel::TestHook>,
+    failure_stages: Option<Arc<FailureCounters>>,
 }
 
 impl QueueInner {
-    fn fail(&self, hr: HRESULT, request: Request, file: Option<&FileInner>) {
+    fn fail(&self, hr: HRESULT, request: Request, file: Option<&FileInner>, stage: FailureStage) {
         FAILED.fetch_add(1, Ordering::Relaxed);
+        if let Some(counts) = &self.failure_stages {
+            counts.note(stage, hr);
+        }
         let mut e = self.errors.lock().unwrap();
         e.0 += 1;
         if e.1.is_none() {
@@ -1118,8 +1181,8 @@ impl QueueInner {
         }
     }
 
-    fn update_error(&self, hr: HRESULT, req: Request, file: Option<&FileInner>, since_status: &mut HRESULT) {
-        self.fail(hr, req, file);
+    fn update_error(&self, hr: HRESULT, req: Request, file: Option<&FileInner>, stage: FailureStage, since_status: &mut HRESULT) {
+        self.fail(hr, req, file, stage);
         if *since_status >= 0 {
             *since_status = hr;
         }
@@ -1141,11 +1204,11 @@ impl QueueInner {
                     // Cancelled requests are skipped without affecting status or error record.
                     return;
                 }
-                if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
-                    self.update_error(hr, req, file.as_deref(), since_status);
+                if let Err((stage, hr)) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
+                    self.update_error(hr, req, file.as_deref(), stage, since_status);
                 }
             }
-            Entry::Refused { seq, hr, req, file, fill } => {
+            Entry::Refused { seq, hr, stage, req, file, fill } => {
                 // a cancelled request is no failure, refused or not
                 if self.is_cancelled(seq, req.tag) {
                     return;
@@ -1154,7 +1217,7 @@ impl QueueInner {
                     // the destination gets solid blocks; the request still fails
                     unsafe { bcpack_fill(&req, t) };
                 }
-                self.update_error(hr, req, file.as_deref(), since_status);
+                self.update_error(hr, req, file.as_deref(), stage, since_status);
             }
             Entry::Status(s, i) => {
                 if let Some(slot) = s.slots.get(i as usize) {
@@ -1197,8 +1260,8 @@ impl QueueInner {
     }
 
     /// A request refused at enqueue, numbered as a request so `CancelRequestsWithTag` covers it.
-    fn enqueue_refused(self: &Arc<Self>, hr: HRESULT, req: Request, file: Option<Arc<FileInner>>, fill: Option<FillTarget>) {
-        self.enqueue_numbered(|seq| Entry::Refused { seq, hr, req, file, fill });
+    fn enqueue_refused(self: &Arc<Self>, hr: HRESULT, req: Request, file: Option<Arc<FileInner>>, fill: Option<FillTarget>, stage: FailureStage) {
+        self.enqueue_numbered(|seq| Entry::Refused { seq, hr, stage, req, file, fill });
     }
 
     fn enqueue_numbered(self: &Arc<Self>, entry: impl FnOnce(u64) -> Entry) {
@@ -1289,6 +1352,7 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         pool_override: OnceLock::new(),
         #[cfg(test)]
         test_hook: OnceLock::new(),
+        failure_stages: failure_counters().cloned(),
     });
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
@@ -1343,7 +1407,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
                 };
             }
         }
-        return q.enqueue_refused(hr, r, None, fill);
+        return q.enqueue_refused(hr, r, None, fill, FailureStage::EnqueueValidation);
     }
     let file = if r.memory_source() {
         None
@@ -1352,7 +1416,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         let f = r.source as *mut c_void;
         let mut vt = 0usize;
         if !read_own(f as usize, &mut vt as *mut usize as *mut u8, 8) || vt != file_vtbl().as_ptr() as usize {
-            return q.enqueue_refused(E_FILE_HANDLE, r, None, None);
+            return q.enqueue_refused(E_FILE_HANDLE, r, None, None, FailureStage::EnqueueFile);
         }
         Some(Arc::clone(inner::<FileInner>(f)))
     };
@@ -1360,7 +1424,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         match snapshot_page_array(r.destination, r.destination_page_offset, r.destination_size) {
             Ok(pages) => Some(pages),
             Err(hr) => {
-                return q.enqueue_refused(hr, r, file, None);
+                return q.enqueue_refused(hr, r, file, None, FailureStage::DestinationSnapshot);
             }
         }
     } else {
@@ -1370,7 +1434,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         match snapshot_page_array(r.source, r.source_page_offset, r.source_size) {
             Ok(pages) => Some(pages),
             Err(hr) => {
-                return q.enqueue_refused(hr, r, file, None);
+                return q.enqueue_refused(hr, r, file, None, FailureStage::SourceSnapshot);
             }
         }
     } else {
@@ -1804,6 +1868,8 @@ mod tests {
             desc[10] = 2;
             let mut q = std::ptr::null_mut();
             assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let counts = Arc::new(FailureCounters::default());
+            Arc::get_mut(&mut (*(q as *mut Object<QueueInner>)).inner).unwrap().failure_stages = Some(Arc::clone(&counts));
             let mut s = std::ptr::null_mut();
             assert_eq!(create_status(f, 3, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
             let qv = *(q as *const *const usize);
@@ -1846,10 +1912,124 @@ mod tests {
             let mut rec = [0u8; ERROR_RECORD_BYTES];
             record(q, rec.as_mut_ptr());
             assert_eq!(u32::from_le_bytes(rec[0..4].try_into().unwrap()), 2, "two failures: tag 0x2001 and the one after the cancel");
+            let snapshot = counts.snapshot();
+            assert_eq!(snapshot[&FailureStage::EnqueueValidation], FailureStageCounts { access_violation: 0, other_hresult: 2 });
+            assert_eq!(snapshot.values().map(|n| n.access_violation + n.other_hresult).sum::<u64>(), 2);
 
             queue_close(q);
             queue_release(q);
             status_release(s);
+        }
+    }
+
+    #[test]
+    fn failure_stages_count_mixed_file_requests_without_changing_delivery() {
+        use std::io::Write;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS};
+
+        struct Fixture {
+            q: *mut c_void,
+            file: *mut c_void,
+            blocked: *mut c_void,
+            path: std::path::PathBuf,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                unsafe {
+                    if !self.q.is_null() { queue_close(self.q); queue_release(self.q); }
+                    if !self.file.is_null() { file_release(self.file); }
+                    if !self.blocked.is_null() { assert_ne!(VirtualFree(self.blocked, 0, MEM_RELEASE), 0); }
+                }
+                std::fs::remove_file(&self.path).expect("remove owned fixture");
+            }
+        }
+        unsafe {
+            for enabled in [false, true] {
+                let plain: Vec<u8> = (0..16).collect();
+                let mut destination = [0xCDu8; 16];
+                let pages = [0usize];
+                let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                let path = std::env::temp_dir().join(format!("xcl-dstorage-stages-{}-{nonce}.bin", std::process::id()));
+                let mut disk = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
+                disk.write_all(&plain).unwrap();
+                drop(disk);
+                let mut fixture = Fixture { q: std::ptr::null_mut(), file: std::ptr::null_mut(), blocked: std::ptr::null_mut(), path };
+                let wide: Vec<u16> = fixture.path.to_str().unwrap().encode_utf16().chain(Some(0)).collect();
+                assert_eq!(factory_open_file(std::ptr::null_mut(), wide.as_ptr(), &IID_FILE, &mut fixture.file), S_OK);
+                fixture.blocked = VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+                assert!(!fixture.blocked.is_null());
+                let mut desc = [0u8; 0x18];
+                desc[8..10].copy_from_slice(&64u16.to_le_bytes());
+                assert_eq!(factory_create_queue(std::ptr::null_mut(), desc.as_ptr(), &IID_QUEUE, &mut fixture.q), S_OK);
+                let q = fixture.q;
+                let counts = Arc::new(FailureCounters::default());
+                Arc::get_mut(&mut (*(q as *mut Object<QueueInner>)).inner).unwrap().failure_stages = enabled.then(|| Arc::clone(&counts));
+                let status = Arc::new(StatusInner { slots: (0..3).map(|_| AtomicI32::new(S_OK)).collect() });
+                let wait = |i: usize| {
+                    let start = std::time::Instant::now();
+                    while status.slots[i].load(Ordering::Acquire) == E_PENDING && start.elapsed().as_secs() < 5 {
+                        std::thread::yield_now();
+                    }
+                    assert_ne!(status.slots[i].load(Ordering::Acquire), E_PENDING);
+                };
+                let good = request(0, destination.as_mut_ptr() as u64, 16, fixture.file as u64, 0, 16);
+                for _ in 0..2 {
+                    queue_enqueue_request(q, request(DEST_PHYS_PAGES_BIT, fixture.blocked as u64, 16, fixture.file as u64, 0, 16).as_ptr());
+                    queue_enqueue_request(q, request(0, fixture.blocked as u64, 16, fixture.file as u64, 0, 16).as_ptr());
+                    queue_enqueue_request(q, request(DEST_PHYS_PAGES_BIT, pages.as_ptr() as u64, 16, fixture.file as u64, 0, 16).as_ptr());
+                }
+                queue_enqueue_request(q, request(0, destination.as_mut_ptr() as u64, 16, fixture.file as u64, 16, 16).as_ptr());
+                queue_enqueue_request(q, request(0, destination.as_mut_ptr() as u64, 8, fixture.file as u64, 0, 16).as_ptr());
+                queue_enqueue_request(q, request(0, 0, 16, fixture.file as u64, 0, 16).as_ptr());
+                queue_enqueue_request(q, request(ZLIB_BIT, destination.as_mut_ptr() as u64, 16, fixture.file as u64, 0, 4).as_ptr());
+                queue(q).enqueue(Entry::Status(Arc::clone(&status), 0));
+                assert!(counts.snapshot().values().all(|n| *n == FailureStageCounts::default()), "enqueue is not a reported failure yet");
+                queue_submit(q);
+                wait(0);
+                assert_eq!(status.slots[0].load(Ordering::Acquire), E_ACCESS_VIOLATION);
+                assert_eq!(destination, [0xCD; 16], "failed requests did not overwrite destination");
+                let mut expected = BTreeMap::from(FAILURE_STAGES.map(|s| (s, FailureStageCounts::default())));
+                if enabled {
+                    for s in [FailureStage::DestinationSnapshot, FailureStage::VirtualDestination, FailureStage::PhysicalDelivery] {
+                        expected.get_mut(&s).unwrap().access_violation = 2;
+                    }
+                    for s in [FailureStage::FileRead, FailureStage::EnqueueValidation, FailureStage::Decompression] {
+                        expected.get_mut(&s).unwrap().other_hresult = 1;
+                    }
+                    expected.get_mut(&FailureStage::EnqueueValidation).unwrap().access_violation = 1;
+                }
+                assert_eq!(counts.snapshot(), expected, "all ten failures counted before retrieval, not just the first");
+                queue_enqueue_request(q, good.as_ptr());
+                queue(q).enqueue(Entry::Status(Arc::clone(&status), 1));
+                queue_submit(q);
+                wait(1);
+                assert_eq!(status.slots[1].load(Ordering::Acquire), S_OK);
+                assert_eq!(destination.as_slice(), plain);
+                let mut record = [0u8; ERROR_RECORD_BYTES];
+                queue_retrieve_error_record(q, record.as_mut_ptr());
+                assert_eq!(u32::from_le_bytes(record[..4].try_into().unwrap()), 10);
+                assert_eq!(i32::from_le_bytes(record[8..12].try_into().unwrap()), E_ACCESS_VIOLATION);
+                queue_retrieve_error_record(q, record.as_mut_ptr());
+                assert_eq!(u32::from_le_bytes(record[..4].try_into().unwrap()), 0);
+                assert_eq!(counts.snapshot(), expected, "success and retrieval do not change aggregates");
+                queue_enqueue_request(q, request(0, fixture.blocked as u64, 16, fixture.file as u64, 0, 16).as_ptr());
+                queue(q).enqueue(Entry::Status(Arc::clone(&status), 2));
+                queue_submit(q);
+                wait(2);
+                assert_eq!(status.slots[2].load(Ordering::Acquire), E_ACCESS_VIOLATION);
+                if enabled { expected.get_mut(&FailureStage::VirtualDestination).unwrap().access_violation += 1; }
+                assert_eq!(counts.snapshot(), expected);
+                let report = DStorageStats { failure_stages: enabled.then(|| counts.snapshot()), ..Default::default() };
+                let json = serde_json::to_value(&report).unwrap();
+                if enabled {
+                    let stages = json["failure_stages"].as_object().unwrap();
+                    assert_eq!(stages.len(), 9);
+                    assert_eq!(stages["virtual_destination"], serde_json::json!({"access_violation": 3, "other_hresult": 0}));
+                    assert_eq!(serde_json::from_value::<DStorageStats>(json).unwrap().failure_stages, Some(expected));
+                } else {
+                    assert!(json.get("failure_stages").is_none());
+                }
+            }
         }
     }
 
