@@ -388,8 +388,15 @@ pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
     submit_as(standin, compute, job, false, key);
 }
 
+/// Cold compute prefetch is opt-in (`XCL_PREFETCH_CS=1`). On a retail title's world load it
+/// built about 9,800 pipelines where the title used about 830, and the extra driver work in
+/// flight slowed the pipelines the title was waiting for.
 fn prefetch_cs_enabled() -> bool {
-    std::env::var("XCL_PREFETCH_CS").map_or(true, |v| v.trim() != "0")
+    prefetch_cs_wanted(std::env::var("XCL_PREFETCH_CS").ok().as_deref())
+}
+
+fn prefetch_cs_wanted(v: Option<&str>) -> bool {
+    v.is_some_and(|v| v.trim() == "1")
 }
 
 /// 6 GB of commit are free (matches `dxc::RESERVE_GB`; true when not known).
@@ -533,7 +540,7 @@ mod used {
 }
 
 /// The workers that build the pipelines of an earlier run ahead of their first use
-/// (`XCL_PSO_PRELOAD=0`: off), plus cold compute pipelines (`XCL_PREFETCH_CS=0`: off).
+/// (`XCL_PSO_PRELOAD=0`: off), plus cold compute pipelines (`XCL_PREFETCH_CS=1`: on).
 /// Apart from the ones a bind sends to (`queue`) and at the lowest priority: a pipeline that
 /// is bound is not held up by the ones made ahead (whoever takes `job` first builds it), and
 /// the title's own threads are not either.
@@ -1334,6 +1341,16 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(counts().2, pending_unbuilt_slow(), "O(1) pending count diverged from PENDING scan");
+    }
+
+    #[test]
+    fn cold_compute_prefetch_is_opt_in() {
+        assert!(!prefetch_cs_wanted(None));
+        assert!(!prefetch_cs_wanted(Some("")));
+        assert!(!prefetch_cs_wanted(Some("0")));
+        assert!(!prefetch_cs_wanted(Some("yes")));
+        assert!(prefetch_cs_wanted(Some("1")));
+        assert!(prefetch_cs_wanted(Some(" 1 ")));
     }
 
     #[test]
